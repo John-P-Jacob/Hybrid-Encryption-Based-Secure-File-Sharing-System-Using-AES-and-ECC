@@ -1,0 +1,218 @@
+#!/bin/bash
+# crypto.sh
+#
+# This script implements a secure file sharing system that provides
+# confidentiality, integrity, and authenticity for a shared file.
+#
+# It supports two modes:
+#  1. Sender mode: Encrypts and signs a plaintext file for a group of 3 receivers.
+#     Usage:
+#       ./crypto.sh -sender <receiver1_pub> <receiver2_pub> <receiver3_pub> <sender_priv> <plaintext_file> <zip_filename>
+#
+#  2. Receiver mode: Decrypts and verifies the file.
+#     Usage:
+#       ./crypto.sh -receiver <receiver_priv> <sender_pub> <zip_file> <plaintext_file>
+#
+# In sender mode:
+#   - A random symmetric key (a 32-byte hex string) is generated.
+#   - The plaintext file is encrypted with AES-256-CBC using OpenSSL’s -pbkdf2 option.
+#   - The encrypted file is signed with the sender’s ECC private key (using SHA-512).
+#   - For each receiver, a cryptographic envelope is created by:
+#         • Deriving an ECDH shared secret from the sender’s private key and the receiver’s public key.
+#         • Hashing it (SHA-256) to obtain a key-encryption key (KEK).
+#         • Encrypting the symmetric key using AES-256-CBC with a random IV.
+#         • Prepending the IV (16 bytes) to the envelope ciphertext.
+#   - The final zip file contains the encrypted file, signature, and 3 envelope files.
+#
+# In receiver mode:
+#   - The zip file is unzipped.
+#   - The receiver uses his ECC private key and the sender’s public key to derive the KEK.
+#   - Each envelope is tried; the correct one will yield a symmetric key of the expected length.
+#   - That key is used to decrypt the encrypted file.
+#   - Finally, the signature is verified using the sender’s public key.
+#
+# All error messages are printed to stderr and contain the string "ERROR last.f"
+# (where "last.f" is our Northeastern username).
+#
+
+# Function to print an error message and exit.
+error_exit() {
+    echo "ERROR last.f: $1" >&2
+    # Remove the temporary directory if set
+    [ -n "$tmpdir" ] && rm -rf "$tmpdir"
+    exit 1
+}
+
+# Check at least one argument is provided.
+if [ "$#" -lt 1 ]; then
+    error_exit "Incorrect arguments: Expected usage ./crypto.sh -sender ... or -receiver ..."
+fi
+
+MODE="$1"
+
+if [ "$MODE" = "-sender" ]; then
+    # Sender mode expects 6 additional arguments.
+    if [ "$#" -ne 7 ]; then
+        error_exit "Incorrect arguments for sender: Expected usage: ./crypto.sh -sender <receiver1_pub> <receiver2_pub> <receiver3_pub> <sender_priv> <plaintext_file> <zip_filename>"
+    fi
+
+    # Assign input arguments.
+    receiver1_pub="$2"
+    receiver2_pub="$3"
+    receiver3_pub="$4"
+    sender_priv="$5"
+    plaintext_file="$6"
+    zip_filename="$7"
+
+    # Check that all input files exist.
+    for file in "$receiver1_pub" "$receiver2_pub" "$receiver3_pub" "$sender_priv" "$plaintext_file"; do
+        [ -f "$file" ] || error_exit "File '$file' not found."
+    done
+
+    # Create a temporary working directory.
+    tmpdir=$(mktemp -d) || error_exit "Failed to create temporary directory."
+
+    # Generate a random symmetric key (32 bytes in hex; 64 hex characters).
+    SYMKEY=$(openssl rand -hex 32) || { rm -rf "$tmpdir"; error_exit "Failed to generate symmetric key."; }
+    # Save the symmetric key to a temporary file (to be encrypted for each receiver).
+    echo -n "$SYMKEY" > "$tmpdir/symkey.txt" || error_exit "Failed to write symmetric key to file."
+
+    # Encrypt the plaintext file using AES-256-CBC with PBKDF2.
+    # The salt is automatically embedded in the output.
+    openssl enc -aes-256-cbc -pbkdf2 -salt -in "$plaintext_file" -out "$tmpdir/file.enc" -pass pass:"$SYMKEY" 2>/dev/null
+    [ "$?" -eq 0 ] || error_exit "File encryption failed."
+
+    # Sign the encrypted file using the sender's private key (using SHA-512).
+    openssl dgst -sha512 -sign "$sender_priv" -out "$tmpdir/signature.bin" "$tmpdir/file.enc" 2>/dev/null
+    [ "$?" -eq 0 ] || error_exit "File signing failed."
+
+    # Create an array of the three receiver public keys.
+    receivers=( "$receiver1_pub" "$receiver2_pub" "$receiver3_pub" )
+
+    # For each receiver, create an envelope that encrypts the symmetric key.
+    for i in 0 1 2; do
+        recv_pub="${receivers[$i]}"
+        envelope_file="$tmpdir/envelope$((i+1)).bin"
+
+        # Derive a shared secret using sender's private key and the receiver's public key.
+        openssl pkeyutl -derive -inkey "$sender_priv" -peerkey "$recv_pub" -out "$tmpdir/shared.bin" 2>/dev/null
+        [ "$?" -eq 0 ] || error_exit "Shared secret derivation failed for receiver $((i+1))."
+
+        # Hash the shared secret with SHA-256 to create the key-encryption key (KEK).
+        KEK=$(openssl dgst -sha256 -binary "$tmpdir/shared.bin" | xxd -p -c 256)
+        [ -n "$KEK" ] || error_exit "Failed to derive KEK for receiver $((i+1))."
+
+        # Generate a random IV (16 bytes, expressed in hex) for envelope encryption.
+        IV=$(openssl rand -hex 16)
+        [ -n "$IV" ] || error_exit "Failed to generate IV for receiver $((i+1))."
+
+        # Convert the IV from hex to binary.
+        echo "$IV" | xxd -r -p > "$tmpdir/iv.bin" || error_exit "Failed to convert IV to binary for receiver $((i+1))."
+
+        # Encrypt the symmetric key (stored in symkey.txt) using AES-256-CBC with the KEK and IV.
+        # We use -nosalt because the IV is provided.
+        openssl enc -aes-256-cbc -in "$tmpdir/symkey.txt" -out "$tmpdir/env_temp.bin" -K "$KEK" -iv "$IV" -nosalt 2>/dev/null
+        [ "$?" -eq 0 ] || error_exit "Envelope encryption failed for receiver $((i+1))."
+
+        # Prepend the IV (16 bytes) to the envelope ciphertext.
+        cat "$tmpdir/iv.bin" "$tmpdir/env_temp.bin" > "$envelope_file" || error_exit "Failed to create envelope file for receiver $((i+1))."
+
+        # Clean up temporary files for this iteration.
+        rm -f "$tmpdir/shared.bin" "$tmpdir/iv.bin" "$tmpdir/env_temp.bin"
+    done
+
+    # Create a zip file containing the encrypted file, signature, and envelopes.
+    (
+      cd "$tmpdir" || error_exit "Failed to change directory to temporary directory."
+      zip -q "$OLDPWD/$zip_filename" file.enc signature.bin envelope1.bin envelope2.bin envelope3.bin
+    )
+    [ "$?" -eq 0 ] || error_exit "Failed to create zip file."
+
+    # Clean up and exit.
+    rm -rf "$tmpdir"
+    exit 0
+
+elif [ "$MODE" = "-receiver" ]; then
+    # Receiver mode expects 4 additional arguments.
+    if [ "$#" -ne 5 ]; then
+        error_exit "Incorrect arguments for receiver: Expected usage: ./crypto.sh -receiver <receiver_priv> <sender_pub> <zip_file> <plaintext_file>"
+    fi
+
+    receiver_priv="$2"
+    sender_pub="$3"
+    zip_file="$4"
+    output_plaintext="$5"
+
+    # Check that input files exist.
+    for file in "$receiver_priv" "$sender_pub" "$zip_file"; do
+        [ -f "$file" ] || error_exit "File '$file' not found."
+    done
+
+    # Create a temporary working directory.
+    tmpdir=$(mktemp -d) || error_exit "Failed to create temporary directory."
+
+    # Unzip the provided zip file into the temporary directory.
+    unzip -q "$zip_file" -d "$tmpdir" || error_exit "Failed to unzip the file."
+
+    # Verify that required files exist in the unzipped directory.
+    [ -f "$tmpdir/file.enc" ] || error_exit "Missing encrypted file in the zip archive."
+    [ -f "$tmpdir/signature.bin" ] || error_exit "Missing signature in the zip archive."
+
+    # Derive the KEK using the receiver's private key and the sender's public key.
+    openssl pkeyutl -derive -inkey "$receiver_priv" -peerkey "$sender_pub" -out "$tmpdir/shared.bin" 2>/dev/null
+    [ "$?" -eq 0 ] || error_exit "Shared secret derivation failed on receiver side."
+    KEK=$(openssl dgst -sha256 -binary "$tmpdir/shared.bin" | xxd -p -c 256)
+    [ -n "$KEK" ] || error_exit "Failed to derive KEK on receiver side."
+
+    # Try each envelope file to decrypt the symmetric key.
+    SYMKEY=""
+    found_key=0
+    for env in "$tmpdir"/envelope*.bin; do
+        [ -f "$env" ] || continue
+        # Extract the IV (first 16 bytes) from the envelope.
+        dd if="$env" of="$tmpdir/iv.bin" bs=16 count=1 2>/dev/null
+        [ "$?" -eq 0 ] || continue
+        # Convert the binary IV to hex.
+        IV_hex=$(xxd -p -c 256 "$tmpdir/iv.bin")
+        # Extract the ciphertext (the remainder of the envelope).
+        dd if="$env" of="$tmpdir/env_cipher.bin" bs=16 skip=1 2>/dev/null
+
+        # Attempt to decrypt the envelope.
+        openssl enc -d -aes-256-cbc -in "$tmpdir/env_cipher.bin" -out "$tmpdir/symkey_dec.txt" -K "$KEK" -iv "$IV_hex" -nosalt 2>/dev/null
+        if [ "$?" -eq 0 ]; then
+            dec_key=$(cat "$tmpdir/symkey_dec.txt")
+            # Our symmetric key is a 64-character hex string.
+            if [[ ${#dec_key} -eq 64 ]]; then
+                SYMKEY="$dec_key"
+                found_key=1
+                break
+            fi
+        fi
+    done
+
+    if [ $found_key -ne 1 ]; then
+        rm -rf "$tmpdir"
+        error_exit "Digital Envelope Decryption failed. Private key provided cannot access any envelopes."
+    fi
+
+    # Decrypt the encrypted file using the recovered symmetric key.
+    openssl enc -d -aes-256-cbc -pbkdf2 -in "$tmpdir/file.enc" -out "$tmpdir/decrypted.txt" -pass pass:"$SYMKEY" 2>/dev/null
+    [ "$?" -eq 0 ] || error_exit "File decryption failed."
+
+    # Verify the signature of the encrypted file using the sender's public key.
+    verify_output=$(openssl dgst -sha512 -verify "$sender_pub" -signature "$tmpdir/signature.bin" "$tmpdir/file.enc" 2>/dev/null)
+    if [ "$verify_output" != "Verified OK" ]; then
+        rm -rf "$tmpdir"
+        error_exit "Signature verification failed."
+    fi
+
+    # If decryption and signature verification succeeded, output the plaintext file.
+    mv "$tmpdir/decrypted.txt" "$output_plaintext" || error_exit "Failed to output the decrypted plaintext file."
+
+    # Clean up and exit.
+    rm -rf "$tmpdir"
+    exit 0
+
+else
+    error_exit "Invalid mode specified. Use -sender or -receiver."
+fi
